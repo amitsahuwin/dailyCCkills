@@ -7,7 +7,7 @@
 # Output: digest_YYYY-MM-DD.md  (in the same directory as this script)
 # =============================================================================
 
-set -euo pipefail
+set -uo pipefail   # NOTE: no -e so a broken pipe never kills the script
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATE="$(date +%Y-%m-%d)"
@@ -25,43 +25,61 @@ QUERIES=(
   "anthropic claude-code cli"
 )
 
-# ── portable date math (works on macOS & Linux) ───────────────────────────────
+# ── portable date math (macOS + Linux) ───────────────────────────────────────
 days_ago() {
   python3 -c "
 import datetime
-d = datetime.date.today() - datetime.timedelta(days=${1})
-print(d.isoformat())
+print((datetime.date.today() - datetime.timedelta(days=$1)).isoformat())
 "
 }
 
-# ── safe curl: always returns valid JSON ──────────────────────────────────────
+# ── safe curl: writes JSON to a temp file, validates, returns path ────────────
+# Never pipes large JSON through shell variables or argv — avoids broken pipe.
 safe_curl() {
   local url="$1"
-  local result=""
+  local tmp
+  tmp="$(mktemp /tmp/gh_resp.XXXXXX)"
+
+  local http_code=0
   if [[ -n "$AUTH_HEADER" ]]; then
-    result="$(curl -fsSL --max-time 20 \
+    http_code=$(curl -fsSL --max-time 20 \
       -H "$AUTH_HEADER" \
       -H "Accept: application/vnd.github+json" \
-      "$url" 2>/dev/null)" || result=""
+      -w "%{http_code}" -o "$tmp" \
+      "$url" 2>/dev/null) || true
   else
-    result="$(curl -fsSL --max-time 20 \
+    http_code=$(curl -fsSL --max-time 20 \
       -H "Accept: application/vnd.github+json" \
-      "$url" 2>/dev/null)" || result=""
+      -w "%{http_code}" -o "$tmp" \
+      "$url" 2>/dev/null) || true
   fi
-  # Validate JSON; fall back to empty items object on failure
-  if python3 -c "import sys,json; json.loads(sys.argv[1])" "$result" &>/dev/null 2>&1; then
-    echo "$result"
+
+  # Validate the file contains parseable JSON with an "items" key
+  if python3 -c "
+import sys, json
+try:
+    d = json.load(open(sys.argv[1]))
+    assert 'items' in d
+except:
+    sys.exit(1)
+" "$tmp" 2>/dev/null; then
+    echo "$tmp"
   else
-    echo '{"items":[],"message":"empty or rate-limited"}'
+    # Return a valid fallback file
+    echo '{"items":[]}' > "$tmp"
+    echo "$tmp"
   fi
 }
 
-# ── render repo table rows from JSON on stdin ─────────────────────────────────
-parse_repos() {
-  python3 - <<'PYEOF'
+# ── render repo table rows from a JSON file ───────────────────────────────────
+parse_repos_file() {
+  local file="$1"
+  local date_col="${2:-pushed_at}"   # pushed_at or created_at
+  python3 - "$file" "$date_col" <<'PYEOF'
 import sys, json
+file, date_col = sys.argv[1], sys.argv[2]
 try:
-    data = json.load(sys.stdin)
+    data = json.load(open(file))
 except Exception:
     data = {}
 items = data.get("items", [])
@@ -72,19 +90,20 @@ for r in items:
     if not full or full in seen:
         continue
     seen.add(full)
-    desc   = (r.get("description") or "No description").replace("\n", " ").strip()[:120]
-    stars  = r.get("stargazers_count", 0)
-    lang   = r.get("language") or "—"
-    url    = r.get("html_url", "")
-    pushed = (r.get("pushed_at", "") or "")[:10]
-    rows.append(f"| [{full}]({url}) | {stars:,} ⭐ | {lang} | {desc} | {pushed} |")
+    desc  = (r.get("description") or "No description").replace("\n", " ").strip()[:120]
+    stars = r.get("stargazers_count", 0)
+    lang  = r.get("language") or "—"
+    url   = r.get("html_url", "")
+    date  = (r.get(date_col, "") or "")[:10]
+    rows.append(f"| [{full}]({url}) | {stars:,} ⭐ | {lang} | {desc} | {date} |")
 if rows:
     print("\n".join(rows))
 else:
     msg = data.get("message", "")
-    note = f" ({msg})" if msg and msg != "empty or rate-limited" else " — set GH_TOKEN to raise limits"
-    print(f"| ⚠️ No results{note} | — | — | — | — |")
+    hint = f" ({msg})" if msg else " — set GH_TOKEN to raise API limits"
+    print(f"| ⚠️ No results{hint} | — | — | — | — |")
 PYEOF
+  rm -f "$file"
 }
 
 # ── weekly trending section ───────────────────────────────────────────────────
@@ -100,7 +119,9 @@ fetch_section() {
   echo ""
   echo "| Repo | Stars | Lang | Description | Last Push |"
   echo "|------|-------|------|-------------|-----------|"
-  safe_curl "$url" | parse_repos
+  local tmp
+  tmp="$(safe_curl "$url")"
+  parse_repos_file "$tmp" "pushed_at"
   echo ""
 }
 
@@ -114,26 +135,9 @@ fetch_new_repos() {
   echo ""
   echo "| Repo | Stars | Lang | Description | Created |"
   echo "|------|-------|------|-------------|---------|"
-
-  safe_curl "$url" | python3 - <<'PYEOF'
-import sys, json
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    data = {}
-items = data.get("items", [])
-if not items:
-    print("| — | — | — | No new repos in last 24 h | — |")
-else:
-    for r in items:
-        full    = r.get("full_name", "")
-        url     = r.get("html_url", "")
-        stars   = r.get("stargazers_count", 0)
-        lang    = r.get("language") or "—"
-        desc    = (r.get("description") or "No description").replace("\n", " ").strip()[:100]
-        created = (r.get("created_at", "") or "")[:10]
-        print(f"| [{full}]({url}) | {stars:,} ⭐ | {lang} | {desc} | {created} |")
-PYEOF
+  local tmp
+  tmp="$(safe_curl "$url")"
+  parse_repos_file "$tmp" "created_at"
   echo ""
 }
 
@@ -147,11 +151,12 @@ fetch_discussions() {
   echo ""
   echo "| Title | Repo | Type | Updated |"
   echo "|-------|------|------|---------|"
-
-  safe_curl "$url" | python3 - <<'PYEOF'
+  local tmp
+  tmp="$(safe_curl "$url")"
+  python3 - "$tmp" <<'PYEOF'
 import sys, json
 try:
-    data = json.load(sys.stdin)
+    data = json.load(open(sys.argv[1]))
 except Exception:
     data = {}
 items = data.get("items", [])
@@ -166,6 +171,7 @@ else:
         updated = (i.get("updated_at", "") or "")[:10]
         print(f"| [{title}]({url}) | {repo} | {kind} | {updated} |")
 PYEOF
+  rm -f "$tmp"
   echo ""
 }
 
